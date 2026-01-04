@@ -1,16 +1,158 @@
 import json
 import copy
+import base64
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
+
+# 级联处理配置
+CASCADE_CONFIG = {
+    "vision_model": "hunyuan-vision-1.5-instruct",  # 视觉模型
+    "text_model": "hunyuan-2.0-instruct-20251111",   # 文本模型（支持工具调用）
+    "api_key": "sk-YNffJN7tOC7wVXo4NA6y0ptFTivyZd8YfoA4MIqW8kiJQnBB",
+    "api_base": "https://api.hunyuan.cloud.tencent.com/v1",
+}
 
 class HunyuanMessageFixer(CustomLogger):
     """
     LiteLLM 自定义回调：在请求发送到混元之前修正消息格式
     混元要求：messages 必须以 user 或 tool 结尾
+    
+    新增功能：级联处理
+    - 当请求包含图片时，先用视觉模型分析图片
+    - 将图片描述替换原图片内容
+    - 再用文本模型处理（支持工具调用）
     """
     
     def __init__(self):
         super().__init__()
+    
+    def _contains_image(self, content) -> bool:
+        """检测内容中是否包含图片"""
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "image_url":
+                        return True
+                    # 检查 image_url 中的 url
+                    image_url = item.get("image_url", {})
+                    if isinstance(image_url, dict):
+                        url = image_url.get("url", "")
+                        if url.startswith("data:image/") or url.startswith("http"):
+                            return True
+        elif isinstance(content, str):
+            if content.startswith("data:image/"):
+                return True
+        return False
+    
+    def _extract_images_from_content(self, content) -> tuple:
+        """
+        从内容中提取图片和文本
+        返回: (图片列表, 纯文本内容)
+        """
+        images = []
+        text_parts = []
+        
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "image_url":
+                        images.append(item)
+                    elif item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    text_parts.append(item)
+        elif isinstance(content, str):
+            if content.startswith("data:image/"):
+                images.append({"type": "image_url", "image_url": {"url": content}})
+            else:
+                text_parts.append(content)
+        
+        return images, " ".join(text_parts)
+    
+    def _has_images_in_messages(self, messages: list) -> bool:
+        """检查消息列表中是否包含图片"""
+        for msg in messages:
+            content = msg.get("content")
+            if self._contains_image(content):
+                return True
+        return False
+    
+    async def _analyze_image_with_vision_model(self, image_content: list, context_text: str) -> str:
+        """
+        使用视觉模型分析图片
+        返回图片的文本描述
+        """
+        try:
+            # 构建视觉模型请求
+            vision_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"请详细描述这张图片的内容，包括所有可见的文字、代码、图表、界面元素等。用户的问题是：{context_text}"},
+                        *image_content
+                    ]
+                }
+            ]
+            
+            print(f"[HunyuanCascade] 调用视觉模型分析图片...")
+            
+            # 调用视觉模型
+            response = await litellm.acompletion(
+                model=f"openai/{CASCADE_CONFIG['vision_model']}",
+                messages=vision_messages,
+                api_key=CASCADE_CONFIG["api_key"],
+                api_base=CASCADE_CONFIG["api_base"],
+                max_tokens=2000,
+            )
+            
+            description = response.choices[0].message.content
+            print(f"[HunyuanCascade] 图片分析完成，描述长度: {len(description)}")
+            return description
+            
+        except Exception as e:
+            print(f"[HunyuanCascade] 视觉模型调用失败: {e}")
+            return f"[图片分析失败: {str(e)}]"
+    
+    async def _process_cascade(self, data: dict) -> dict:
+        """
+        级联处理：图片先由视觉模型分析，然后转为文本给文本模型处理
+        """
+        messages = data.get("messages", [])
+        processed_messages = []
+        
+        for msg in messages:
+            content = msg.get("content")
+            role = msg.get("role")
+            
+            if self._contains_image(content):
+                # 提取图片和文本
+                images, text = self._extract_images_from_content(content)
+                
+                if images:
+                    # 调用视觉模型分析图片
+                    description = await self._analyze_image_with_vision_model(images, text)
+                    
+                    # 用图片描述替换原内容
+                    new_content = f"{text}\n\n[图片内容描述]:\n{description}"
+                    
+                    processed_messages.append({
+                        **msg,
+                        "content": new_content
+                    })
+                    print(f"[HunyuanCascade] 已将图片转换为文本描述")
+                else:
+                    processed_messages.append(msg)
+            else:
+                processed_messages.append(msg)
+        
+        data["messages"] = processed_messages
+        
+        # 强制使用文本模型（支持工具调用）
+        original_model = data.get("model", "")
+        data["model"] = CASCADE_CONFIG["text_model"]
+        print(f"[HunyuanCascade] 模型切换: {original_model} -> {CASCADE_CONFIG['text_model']}")
+        
+        return data
     
     def _fix_messages(self, messages: list) -> list:
         """
@@ -40,7 +182,7 @@ class HunyuanMessageFixer(CustomLogger):
             # 添加当前消息
             if role == "assistant":
                 # 确保 assistant 消息有 content
-                if not msg.get("content") or not msg.get("content").strip():
+                if not msg.get("content") or (isinstance(msg.get("content"), str) and not msg.get("content").strip()):
                     if msg.get("tool_calls"):
                         # 从 tool_calls 生成描述
                         tool_names = []
@@ -61,14 +203,14 @@ class HunyuanMessageFixer(CustomLogger):
                     # 在 tool 和 user 之间插入一个过渡 assistant 消息
                     tool_content = msg.get("content", "")
                     # 生成简短的工具结果摘要
-                    if len(tool_content) > 200:
-                        summary = tool_content[:200] + "..."
+                    if len(str(tool_content)) > 200:
+                        summary = str(tool_content)[:200] + "..."
                     else:
                         summary = tool_content if tool_content else "工具执行完成"
                     
                     transition_msg = {
                         "role": "assistant",
-                        "content": f"工具返回了结果。{summary[:100]}"
+                        "content": f"工具返回了结果。{str(summary)[:100]}"
                     }
                     fixed_messages.append(transition_msg)
                     print(f"[HunyuanFixer] 在 tool 和 user 之间插入 assistant 消息")
@@ -98,8 +240,19 @@ class HunyuanMessageFixer(CustomLogger):
         
         # 只处理 chat completion 请求
         if call_type == "completion" or call_type == "acompletion":
+            model_name = data.get("model", "")
+            print(f"[HunyuanFixer] 请求模型: {model_name}")
+            
+            # 检查是否包含图片
+            has_images = self._has_images_in_messages(data.get("messages", []))
+            
+            if has_images:
+                print(f"[HunyuanCascade] 检测到图片内容，启动级联处理")
+                # 级联处理：先用视觉模型分析图片，再用文本模型处理
+                data = await self._process_cascade(data)
+            
             # 记录完整的原始请求（用于调试）
-            print(f"[HunyuanFixer] ====== 原始请求 ======")
+            print(f"[HunyuanFixer] ====== 处理后请求 ======")
             print(f"[HunyuanFixer] messages 数量: {len(data.get('messages', []))}")
             for i, msg in enumerate(data.get("messages", [])):
                 role = msg.get("role")
@@ -108,12 +261,13 @@ class HunyuanMessageFixer(CustomLogger):
                 tool_call_id = msg.get("tool_call_id")
                 
                 # 截断 content 用于日志
-                content_preview = str(content)[:100] + "..." if content and len(str(content)) > 100 else content
+                content_str = str(content) if content else ""
+                content_preview = content_str[:100] + "..." if len(content_str) > 100 else content_str
                 
                 print(f"[HunyuanFixer] msg[{i}]: role={role}, content={content_preview}, tool_calls={bool(tool_calls)}, tool_call_id={tool_call_id}")
-            print(f"[HunyuanFixer] ====== 原始请求结束 ======")
+            print(f"[HunyuanFixer] ====== 处理后请求结束 ======")
             
-            # 修正消息
+            # 修正消息（确保以 user 或 tool 结尾等）
             if "messages" in data:
                 data["messages"] = self._fix_messages(data["messages"])
             
