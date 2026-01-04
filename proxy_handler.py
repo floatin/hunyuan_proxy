@@ -154,6 +154,44 @@ class HunyuanMessageFixer(CustomLogger):
         
         return data
     
+    def _ensure_content_not_empty(self, msg: dict) -> dict:
+        """确保消息的 content 不为空"""
+        msg = copy.deepcopy(msg)
+        content = msg.get("content")
+        role = msg.get("role", "")
+        
+        # 检查 content 是否为空
+        is_empty = False
+        if content is None:
+            is_empty = True
+        elif isinstance(content, str) and not content.strip():
+            is_empty = True
+        elif isinstance(content, list) and len(content) == 0:
+            is_empty = True
+        
+        if is_empty:
+            if role == "assistant":
+                if msg.get("tool_calls"):
+                    # 从 tool_calls 生成描述
+                    tool_names = []
+                    for tc in msg.get("tool_calls", []):
+                        if isinstance(tc, dict) and "function" in tc:
+                            tool_names.append(tc["function"].get("name", "unknown"))
+                    msg["content"] = f"我将调用工具：{', '.join(tool_names)}"
+                else:
+                    msg["content"] = "好的，我来处理。"
+            elif role == "user":
+                msg["content"] = "请继续。"
+            elif role == "system":
+                msg["content"] = "你是一个有帮助的AI助手。"
+            elif role == "tool":
+                msg["content"] = "工具执行完成。"
+            else:
+                msg["content"] = "..."
+            print(f"[HunyuanFixer] 修复空 content: role={role}")
+        
+        return msg
+    
     def _fix_messages(self, messages: list) -> list:
         """
         修正消息列表，使其兼容混元大模型
@@ -161,6 +199,7 @@ class HunyuanMessageFixer(CustomLogger):
         混元约束：
         1. messages 必须以 user 或 tool 结尾
         2. tool 后面如果是 user，需要在中间插入 assistant 消息
+        3. 所有消息的 content 不能为空
         
         解决方案：保留完整的工具调用链，只在 tool→user 之间插入 assistant 消息
         """
@@ -179,22 +218,11 @@ class HunyuanMessageFixer(CustomLogger):
         for i, msg in enumerate(messages):
             role = msg.get("role")
             
+            # 确保消息 content 不为空
+            msg = self._ensure_content_not_empty(msg)
+            
             # 添加当前消息
-            if role == "assistant":
-                # 确保 assistant 消息有 content
-                if not msg.get("content") or (isinstance(msg.get("content"), str) and not msg.get("content").strip()):
-                    if msg.get("tool_calls"):
-                        # 从 tool_calls 生成描述
-                        tool_names = []
-                        for tc in msg.get("tool_calls", []):
-                            if isinstance(tc, dict) and "function" in tc:
-                                tool_names.append(tc["function"].get("name", "unknown"))
-                        msg["content"] = f"我将调用工具：{', '.join(tool_names)}"
-                    else:
-                        msg["content"] = "..."
-                fixed_messages.append(msg)
-            else:
-                fixed_messages.append(msg)
+            fixed_messages.append(msg)
             
             # 检查是否需要在 tool 和 user 之间插入 assistant
             if role == "tool" and i + 1 < len(messages):
