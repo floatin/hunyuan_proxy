@@ -1,13 +1,12 @@
-import json
+import os
 import copy
-import base64
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
 
 # 级联处理配置
 CASCADE_CONFIG = {
     "vision_model": "hunyuan-vision-1.5-instruct",  # 视觉模型
-    "text_model": "hunyuan-2.0-instruct-20251111",   # 文本模型（支持工具调用）
+    "text_model": "`hunyuan-2.0-thinking-20251109`",   # 文本模型（支持工具调用）
     "api_key": "sk-YNffJN7tOC7wVXo4NA6y0ptFTivyZd8YfoA4MIqW8kiJQnBB",
     "api_base": "https://api.hunyuan.cloud.tencent.com/v1",
 }
@@ -328,9 +327,14 @@ class HunyuanMessageFixer(CustomLogger):
 # 创建回调实例
 hunyuan_fixer = HunyuanMessageFixer()
 
+# 设置环境变量
+os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-c2b9d9dd-8dba-4a2a-90fe-6918716c2200"
+os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-045c8a19-6073-444e-a567-29fcfc6fa751"
+os.environ["LANGFUSE_HOST"] = "http://127.0.0.1:13000" 
+
 # 设置 litellm 参数
 litellm.drop_params = True
-litellm.callbacks = [hunyuan_fixer]
+litellm.callbacks = ["langfuse",hunyuan_fixer]
 
 if __name__ == "__main__":
     import uvicorn
