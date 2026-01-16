@@ -4,3 +4,8 @@ __pycache__/
 config.yaml
 logs/
 .env
+openspec
+AGENTS.md
+.roo
+
+
