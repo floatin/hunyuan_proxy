@@ -23,7 +23,7 @@ show_help() {
     echo ""
     echo "Commands:"
     echo "  init        Initialize project with dual remotes"
-    echo "  checkpoint  Create a checkpoint snapshot"
+    echo "  checkpoint  Create a checkpoint snapshot (local Gitea only)"
     echo "  finalize    Finalize change and prepare for PR"
     echo "  sync-main   Sync main branch after merge"
 }
@@ -35,9 +35,9 @@ init_project() {
     print_msg "Project initialized successfully" "$GREEN"
 }
 
-# 创建检查点
+# 创建检查点 - 仅在本地 Gitea (origin) 存档
 checkpoint() {
-    print_msg "Creating checkpoint..." "$BLUE"
+    print_msg "Creating checkpoint (local Gitea only)..." "$BLUE"
     
     # 获取当前时间戳
     timestamp=$(date +"%Y%m%d-%H%M%S")
@@ -51,12 +51,12 @@ checkpoint() {
     git tag -a "$tag_name" -m "Checkpoint at ${timestamp}"
     print_msg "Created tag: $tag_name" "$GREEN"
     
-    # 仅推送到 origin (本地 Gitea)
+    # 仅推送到 origin (本地 Gitea)，不推送到 upstream (GitHub)
     git push origin HEAD
     git push origin "$tag_name"
     
     print_msg "Checkpoint completed: $tag_name" "$GREEN"
-    print_msg "Pushed to origin only (local Gitea)" "$YELLOW"
+    print_msg "Pushed to origin only (local Gitea) - NOT pushed to GitHub" "$YELLOW"
 }
 
 # 完成变更
