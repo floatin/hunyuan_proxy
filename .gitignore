@@ -4,8 +4,7 @@ __pycache__/
 config.yaml
 logs/
 .env
-openspec
+openspec/
 AGENTS.md
-.roo
-
-
+.roo/
+.claude/
