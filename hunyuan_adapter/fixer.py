@@ -1,24 +1,18 @@
-"""
-LiteLLM 回调实现模块
-
-从原 proxy_handler.py 提取并重构的回调功能：
-- HunyuanMessageFixer: 主要回调类
-- ImageCache: 图片缓存管理
-- 级联处理逻辑
-"""
+"""混元消息修正回调模块"""
 
 import os
 import copy
 import litellm
-import hashlib
 import time
-import re
-from collections import OrderedDict
 from litellm.integrations.custom_logger import CustomLogger
-from typing import Optional, List, Dict, Any, Tuple
+from dotenv import load_dotenv
 
-# 级联处理配置
-DEFAULT_CONFIG = {
+from .cache import ImageCache
+
+load_dotenv()
+
+# 配置
+CASCADE_CONFIG = {
     "vision_model": "hunyuan-vision-1.5-instruct",
     "text_model": "hunyuan-2.0-thinking-20251109",
     "api_key": os.getenv("API_KEY"),
@@ -28,172 +22,16 @@ DEFAULT_CONFIG = {
     "enable_cache_logging": True,
 }
 
-
-class ImageCache:
-    """高性能图片缓存类"""
-    
-    def __init__(self, max_size: int = 1000, ttl: int = 3600):
-        self.max_size = max_size
-        self.ttl = ttl
-        self.cache = OrderedDict()
-        self.stats = {
-            'hits': 0,
-            'misses': 0,
-            'evictions': 0,
-            'size': 0
-        }
-    
-    def _generate_cache_key(self, image_content) -> Optional[str]:
-        """生成缓存键"""
-        if not image_content:
-            return None
-            
-        if isinstance(image_content, dict) and image_content.get("type") == "image_url":
-            return self._generate_single_image_key(image_content)
-        
-        if isinstance(image_content, list):
-            keys = []
-            for img in image_content:
-                key = self._generate_single_image_key(img)
-                if key:
-                    keys.append(key)
-            return "|".join(keys) if keys else None
-        
-        return None
-    
-    def _generate_single_image_key(self, image_item: dict) -> Optional[str]:
-        """为单张图片生成缓存键"""
-        image_url = image_item.get("image_url", {})
-        if isinstance(image_url, dict):
-            url = image_url.get("url", "")
-        else:
-            url = str(image_url)
-        
-        if url.startswith("data:image/"):
-            return self._generate_base64_key(url)
-        elif url.startswith("http"):
-            return self._generate_url_key(url)
-        else:
-            return f"img_unknown_{hash(url) % 1000000}"
-    
-    def _generate_base64_key(self, data_url: str) -> str:
-        """为base64图片生成SHA256哈希键"""
-        try:
-            if "," in data_url:
-                header, data_part = data_url.split(",", 1)
-            else:
-                data_part = data_url
-            
-            hash_obj = hashlib.sha256(data_part.encode('utf-8'))
-            hash_hex = hash_obj.hexdigest()
-            return f"img_b64_{hash_hex}"
-        except Exception:
-            return f"img_b64_{hash(data_url) % 1000000}"
-    
-    def _generate_url_key(self, url: str) -> str:
-        """为URL图片生成规范化键"""
-        try:
-            from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-            
-            parsed = urlparse(url)
-            if parsed.query:
-                params = parse_qs(parsed.query)
-                normalized_query = urlencode(sorted(params.items()), doseq=True)
-            else:
-                normalized_query = ""
-            
-            normalized_url = urlunparse((
-                parsed.scheme,
-                parsed.netloc,
-                parsed.path,
-                parsed.params,
-                normalized_query,
-                parsed.fragment
-            ))
-            
-            return f"img_url_{hash(normalized_url) % 1000000}"
-        except Exception:
-            return f"img_url_{hash(url) % 1000000}"
-    
-    def get(self, key: str) -> Optional[str]:
-        """获取缓存项"""
-        if key not in self.cache:
-            self.stats['misses'] += 1
-            return None
-        
-        entry = self.cache[key]
-        if time.time() - entry['timestamp'] > self.ttl:
-            del self.cache[key]
-            self.stats['misses'] += 1
-            self.stats['evictions'] += 1
-            return None
-        
-        self.cache.move_to_end(key)
-        self.stats['hits'] += 1
-        return entry['value']
-    
-    def set(self, key: str, value: str):
-        """设置缓存项"""
-        if key is None:
-            return
-            
-        if len(self.cache) >= self.max_size and key not in self.cache:
-            oldest_key = next(iter(self.cache))
-            del self.cache[oldest_key]
-            self.stats['evictions'] += 1
-        
-        self.cache[key] = {
-            'value': value,
-            'timestamp': time.time()
-        }
-        self.cache.move_to_end(key)
-        self.stats['size'] = len(self.cache)
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """获取缓存统计"""
-        total_requests = self.stats['hits'] + self.stats['misses']
-        hit_rate = (self.stats['hits'] / total_requests * 100) if total_requests > 0 else 0
-        
-        return {
-            'hit_rate': round(hit_rate, 2),
-            'hits': self.stats['hits'],
-            'misses': self.stats['misses'],
-            'size': len(self.cache),
-            'max_size': self.max_size,
-            'ttl': self.ttl
-        }
-    
-    def clear(self):
-        """清空缓存"""
-        self.cache.clear()
-        self.stats = {
-            'hits': 0,
-            'misses': 0,
-            'evictions': 0,
-            'size': 0
-        }
-
-
 class HunyuanMessageFixer(CustomLogger):
-    """
-    LiteLLM 自定义回调：在请求发送到混元之前修正消息格式
+    """LiteLLM 自定义回调：消息格式修正 + 级联处理"""
     
-    功能：
-    1. 消息格式修正（确保以 user 或 tool 结尾）
-    2. 级联处理（图片→文本）
-    3. 参数清理
-    4. 缓存管理
-    """
-    
-    def __init__(self, config: Dict[str, Any] = None):
+    def __init__(self):
         super().__init__()
-        self.config = {**DEFAULT_CONFIG, **(config or {})}
-        
-        # 初始化图片缓存
-        cache_max_size = self.config.get("cache_max_size", 1000)
-        cache_ttl = self.config.get("cache_ttl", 3600)
+        # 初始化图片缓存，使用配置参数
+        cache_max_size = CASCADE_CONFIG.get("cache_max_size", 1000)
+        cache_ttl = CASCADE_CONFIG.get("cache_ttl", 3600)
         self.image_cache = ImageCache(max_size=cache_max_size, ttl=cache_ttl)
-        self.enable_cache_logging = self.config.get("enable_cache_logging", True)
+        self.enable_cache_logging = CASCADE_CONFIG.get("enable_cache_logging", True)
     
     def _contains_image(self, content) -> bool:
         """检测内容中是否包含图片"""
@@ -202,6 +40,7 @@ class HunyuanMessageFixer(CustomLogger):
                 if isinstance(item, dict):
                     if item.get("type") == "image_url":
                         return True
+                    # 检查 image_url 中的 url
                     image_url = item.get("image_url", {})
                     if isinstance(image_url, dict):
                         url = image_url.get("url", "")
@@ -212,8 +51,11 @@ class HunyuanMessageFixer(CustomLogger):
                 return True
         return False
     
-    def _extract_images_from_content(self, content) -> Tuple[List[Dict], str]:
-        """从内容中提取图片和文本"""
+    def _extract_images_from_content(self, content) -> tuple:
+        """
+        从内容中提取图片和文本
+        返回: (图片列表, 纯文本内容)
+        """
         images = []
         text_parts = []
         
@@ -234,7 +76,7 @@ class HunyuanMessageFixer(CustomLogger):
         
         return images, " ".join(text_parts)
     
-    def _has_images_in_messages(self, messages: List[Dict]) -> bool:
+    def _has_images_in_messages(self, messages: list) -> bool:
         """检查消息列表中是否包含图片"""
         for msg in messages:
             content = msg.get("content")
@@ -242,12 +84,16 @@ class HunyuanMessageFixer(CustomLogger):
                 return True
         return False
     
-    async def _analyze_image_with_vision_model(self, image_content: List[Dict], context_text: str) -> str:
-        """使用视觉模型分析图片（带缓存）"""
+    async def _analyze_image_with_vision_model(self, image_content: list, context_text: str) -> str:
+        """
+        使用视觉模型分析图片（带缓存）
+        返回图片的文本描述
+        """
         try:
             # 生成缓存键
-            cache_key = self.image_cache._generate_cache_key(image_content)
+            cache_key = self.image_cache.generate_cache_key(image_content)
             if cache_key:
+                # 检查缓存
                 cached_result = self.image_cache.get(cache_key)
                 if cached_result:
                     print(f"[HunyuanCascade] 缓存命中，返回缓存的图片分析结果")
@@ -268,10 +114,10 @@ class HunyuanMessageFixer(CustomLogger):
             
             # 调用视觉模型
             response = await litellm.acompletion(
-                model=f"openai/{self.config['vision_model']}",
+                model=f"openai/{CASCADE_CONFIG['vision_model']}",
                 messages=vision_messages,
-                api_key=self.config["api_key"],
-                api_base=self.config["api_base"],
+                api_key=CASCADE_CONFIG["api_key"],
+                api_base=CASCADE_CONFIG["api_base"],
                 max_tokens=2000,
             )
             
@@ -289,8 +135,31 @@ class HunyuanMessageFixer(CustomLogger):
             print(f"[HunyuanCascade] 视觉模型调用失败: {e}")
             return f"[图片分析失败: {str(e)}]"
     
-    async def _process_cascade(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """级联处理：图片先由视觉模型分析，然后转为文本给文本模型处理"""
+    def clear_image_cache(self):
+        """清空图片缓存"""
+        self.image_cache.clear()
+        print(f"[HunyuanCascade] 图片缓存已清空")
+    
+    def get_cache_stats(self):
+        """获取缓存统计信息"""
+        stats = self.image_cache.get_stats()
+        if self.enable_cache_logging:
+            print(f"[CacheStats] 命中率: {stats['hit_rate']}%, 命中: {stats['hits']}, 未命中: {stats['misses']}, 大小: {stats['size']}/{stats['max_size']}")
+        return stats
+    
+    def delete_cache_entry(self, cache_key):
+        """删除特定缓存项"""
+        success = self.image_cache.delete(cache_key)
+        if success:
+            print(f"[HunyuanCascade] 缓存项已删除: {cache_key}")
+        else:
+            print(f"[HunyuanCascade] 缓存项不存在: {cache_key}")
+        return success
+    
+    async def _process_cascade(self, data: dict) -> dict:
+        """
+        级联处理：图片先由视觉模型分析，然后转为文本给文本模型处理（带缓存）
+        """
         messages = data.get("messages", [])
         processed_messages = []
         
@@ -303,8 +172,26 @@ class HunyuanMessageFixer(CustomLogger):
                 images, text = self._extract_images_from_content(content)
                 
                 if images:
-                    # 调用视觉模型分析图片
-                    description = await self._analyze_image_with_vision_model(images, text)
+                    # 为批量图片生成缓存键（包含上下文信息）
+                    cache_key = self.image_cache.generate_cache_key(images)
+                    if cache_key:
+                        # 在缓存键中包含上下文摘要以确保准确性
+                        context_hash = hash(text) % 1000000
+                        full_cache_key = f"{cache_key}_ctx_{context_hash}"
+                        
+                        # 检查缓存
+                        cached_result = self.image_cache.get(full_cache_key)
+                        if cached_result:
+                            print(f"[HunyuanCascade] 级联处理缓存命中")
+                            description = cached_result
+                        else:
+                            # 调用视觉模型分析图片
+                            description = await self._analyze_image_with_vision_model(images, text)
+                            # 存入缓存
+                            self.image_cache.set(full_cache_key, description)
+                    else:
+                        # 调用视觉模型分析图片
+                        description = await self._analyze_image_with_vision_model(images, text)
                     
                     # 用图片描述替换原内容
                     new_content = f"{text}\n\n[图片内容描述]:\n{description}"
@@ -323,12 +210,12 @@ class HunyuanMessageFixer(CustomLogger):
         
         # 强制使用文本模型（支持工具调用）
         original_model = data.get("model", "")
-        data["model"] = self.config["text_model"]
-        print(f"[HunyuanCascade] 模型切换: {original_model} -> {self.config['text_model']}")
+        data["model"] = CASCADE_CONFIG["text_model"]
+        print(f"[HunyuanCascade] 模型切换: {original_model} -> {CASCADE_CONFIG['text_model']}")
         
         return data
     
-    def _ensure_content_not_empty(self, msg: Dict) -> Dict:
+    def _ensure_content_not_empty(self, msg: dict) -> dict:
         """确保消息的 content 不为空"""
         msg = copy.deepcopy(msg)
         content = msg.get("content")
@@ -346,6 +233,7 @@ class HunyuanMessageFixer(CustomLogger):
         if is_empty:
             if role == "assistant":
                 if msg.get("tool_calls"):
+                    # 从 tool_calls 生成描述
                     tool_names = []
                     for tc in msg.get("tool_calls", []):
                         if isinstance(tc, dict) and "function" in tc:
@@ -365,8 +253,17 @@ class HunyuanMessageFixer(CustomLogger):
         
         return msg
     
-    def _fix_messages(self, messages: List[Dict]) -> List[Dict]:
-        """修正消息列表，使其兼容混元大模型"""
+    def _fix_messages(self, messages: list) -> list:
+        """
+        修正消息列表，使其兼容混元大模型
+        
+        混元约束：
+        1. messages 必须以 user 或 tool 结尾
+        2. tool 后面如果是 user，需要在中间插入 assistant 消息
+        3. 所有消息的 content 不能为空
+        
+        解决方案：保留完整的工具调用链，只在 tool→user 之间插入 assistant 消息
+        """
         if not messages:
             return messages
         
@@ -394,6 +291,7 @@ class HunyuanMessageFixer(CustomLogger):
                 if next_msg.get("role") == "user":
                     # 在 tool 和 user 之间插入一个过渡 assistant 消息
                     tool_content = msg.get("content", "")
+                    # 生成简短的工具结果摘要
                     if len(str(tool_content)) > 200:
                         summary = str(tool_content)[:200] + "..."
                     else:
@@ -423,9 +321,9 @@ class HunyuanMessageFixer(CustomLogger):
         self,
         user_api_key_dict,
         cache,
-        data: Dict[str, Any],
+        data: dict,
         call_type: str,
-    ) -> Dict[str, Any]:
+    ):
         """在 LLM 调用之前修改请求数据"""
         print(f"[HunyuanFixer] async_pre_call_hook 被调用, call_type={call_type}")
         
@@ -442,14 +340,30 @@ class HunyuanMessageFixer(CustomLogger):
                 # 级联处理：先用视觉模型分析图片，再用文本模型处理
                 data = await self._process_cascade(data)
             
+            # 记录完整的原始请求（用于调试）
+            print(f"[HunyuanFixer] ====== 处理后请求 ======")
+            print(f"[HunyuanFixer] messages 数量: {len(data.get('messages', []))}")
+            for i, msg in enumerate(data.get("messages", [])):
+                role = msg.get("role")
+                content = msg.get("content")
+                tool_calls = msg.get("tool_calls")
+                tool_call_id = msg.get("tool_call_id")
+                
+                # 截断 content 用于日志
+                content_str = str(content) if content else ""
+                content_preview = content_str[:100] + "..." if len(content_str) > 100 else content_str
+                
+                print(f"[HunyuanFixer] msg[{i}]: role={role}, content={content_preview}, tool_calls={bool(tool_calls)}, tool_call_id={tool_call_id}")
+            print(f"[HunyuanFixer] ====== 处理后请求结束 ======")
+            
             # 修正消息（确保以 user 或 tool 结尾等）
             if "messages" in data:
                 data["messages"] = self._fix_messages(data["messages"])
             
             # 移除混元不支持的参数
             unsupported_params = [
-                "parallel_tool_calls",
-                "reasoning_effort",
+                "parallel_tool_calls",  # 混元不支持并行工具调用
+                "reasoning_effort",     # 混元不支持
             ]
             for param in unsupported_params:
                 if param in data:
@@ -462,6 +376,7 @@ class HunyuanMessageFixer(CustomLogger):
                 for tool in data.get("tools", []):
                     if isinstance(tool, dict):
                         cleaned_tool = copy.deepcopy(tool)
+                        # 移除 function 中的 strict 字段
                         if "function" in cleaned_tool and isinstance(cleaned_tool["function"], dict):
                             cleaned_tool["function"].pop("strict", None)
                         cleaned_tools.append(cleaned_tool)
@@ -469,15 +384,3 @@ class HunyuanMessageFixer(CustomLogger):
                 print(f"[HunyuanFixer] 清理 tools 参数，共 {len(cleaned_tools)} 个工具")
         
         return data
-    
-    def get_cache_stats(self) -> Dict[str, Any]:
-        """获取缓存统计信息"""
-        stats = self.image_cache.get_stats()
-        if self.enable_cache_logging:
-            print(f"[CacheStats] 命中率: {stats['hit_rate']}%, 命中: {stats['hits']}, 未命中: {stats['misses']}, 大小: {stats['size']}/{stats['max_size']}")
-        return stats
-    
-    def clear_image_cache(self):
-        """清空图片缓存"""
-        self.image_cache.clear()
-        print(f"[HunyuanCascade] 图片缓存已清空")
